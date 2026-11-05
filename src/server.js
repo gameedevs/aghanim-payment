@@ -220,7 +220,106 @@ app.get("/api/payment/status/:orderId", async (req, res) => {
   }
 });
 
-app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+const AGHANIM_ORDERS_URL = "https://api.aghanim.com/s2s/v1/orders";
+const CREATE_LIMIT_PER_MINUTE = 10;
+const createAttempts = new Map();
+
+function allowCreate(playerId) {
+  const now = Date.now();
+  const recent = (createAttempts.get(playerId) || []).filter((t) => now - t < 60000);
+  if (recent.length >= CREATE_LIMIT_PER_MINUTE) return false;
+  recent.push(now);
+  createAttempts.set(playerId, recent);
+  return true;
+}
+
+// Creates an Aghanim order server-side (S2S key stays secret) and returns its checkout URL.
+app.post("/api/payment/create", async (req, res) => {
+  try {
+    const s2sKey = process.env.AGHANIM_S2S_KEY;
+    if (!s2sKey) {
+      console.error("AGHANIM_S2S_KEY is not set");
+      return res.status(500).json({ error: "Payment not configured" });
+    }
+
+    const playerId = String(req.body?.playerId || "").trim();
+    const sku = String(req.body?.sku || "").trim();
+    if (!playerId || !sku || playerId.length > 128 || sku.length > 128) {
+      return res.status(400).json({ error: "playerId and sku are required" });
+    }
+
+    if (!allowCreate(playerId)) {
+      return res.status(429).json({ error: "Too many requests" });
+    }
+
+    const body = { player_id: playerId, items: [{ sku }] };
+    if (process.env.BACK_TO_GAME_URL) body.back_to_game_url = process.env.BACK_TO_GAME_URL;
+
+    const upstream = await fetch(AGHANIM_ORDERS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${s2sKey}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!upstream.ok) {
+      console.error("Aghanim create order failed:", upstream.status, (await upstream.text()).slice(0, 500));
+      return res.status(502).json({ error: "Could not create order" });
+    }
+
+    const created = await upstream.json();
+    const orderId = created.order_id;
+    const checkoutUrl = created.checkout_url;
+    if (!orderId || !checkoutUrl) {
+      console.error("Aghanim create order: unexpected response", Object.keys(created));
+      return res.status(502).json({ error: "Could not create order" });
+    }
+
+    // $setOnInsert so a webhook that somehow arrived first is never downgraded to PENDING.
+    await db.collection("payment_orders").updateOne(
+      { _id: orderId },
+      {
+        $setOnInsert: {
+          orderId, playerId, sku, status: "PENDING",
+          createdAt: new Date(), updatedAt: new Date()
+        }
+      },
+      { upsert: true }
+    );
+
+    return res.json({ orderId, checkoutUrl });
+  } catch (e) {
+    console.error("Create order error:", e.message);
+    return res.status(500).json({ error: "Could not create order" });
+  }
+});
+
+// iOS Universal Links: lets https://<this host>/checkout* reopen the game after payment.
+app.get("/.well-known/apple-app-site-association", (_req, res) => {
+  const teamId = process.env.APPLE_TEAM_ID;
+  const bundleId = process.env.APPLE_BUNDLE_ID;
+  if (!teamId || !bundleId) return res.status(404).json({ error: "Not found" });
+
+  return res.type("application/json").json({
+    applinks: {
+      details: [{
+        appIDs: [`${teamId}.${bundleId}`],
+        components: [{ "/": "/checkout*" }]
+      }]
+    }
+  });
+});
+
+// Fallback page when the link opens in a browser instead of the game.
+app.get("/checkout-complete", (_req, res) => {
+  res.type("html").send("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>" +
+    "<title>Payment complete</title><p style='font-family:sans-serif;text-align:center;margin-top:20vh'>" +
+    "Payment complete. You can return to the game.</p>");
+});
+
+app.use((req, res) => {
+  console.warn("404 Not found:", req.method, req.originalUrl);
+  return res.status(404).json({ error: "Not found" });
+});
 
 async function start() {
   await connectMongo();
