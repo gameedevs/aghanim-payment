@@ -262,7 +262,7 @@ app.post("/api/payment/create", async (req, res) => {
       signal: AbortSignal.timeout(10000)
     });
     if (!upstream.ok) {
-      console.error("Aghanim create order failed:", upstream.status, (await upstream.text()).slice(0, 500));
+      console.error("Aghanim create order failed:", upstream.status, `sku=${sku}`, (await upstream.text()).slice(0, 500));
       return res.status(502).json({ error: "Could not create order" });
     }
 
