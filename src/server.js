@@ -102,7 +102,7 @@ async function processWebhook(event) {
                 ? new Date(Number(event.context.order.paid_at) * 1000) : new Date(),
               updatedAt: new Date()
             },
-            $setOnInsert: { createdAt: new Date() }
+            $setOnInsert: { createdAt: new Date(), claimed: false, claimedAt: null }
           },
           { upsert: true, session }
         );
@@ -193,30 +193,59 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-app.get("/api/payment/status/:orderId", async (req, res) => {
+// Paid orders the player has not been rewarded for yet (direct checkout and Hub alike).
+app.get("/api/payment/unclaimed", async (req, res) => {
+  try {
+    const playerId = String(req.query.playerId || "").trim();
+    if (!playerId || playerId.length > 128) {
+      return res.status(400).json({ error: "playerId is required" });
+    }
+
+    const orders = await db.collection("payment_orders")
+      .find({ playerId, status: "PAID", claimed: { $ne: true } })
+      .sort({ paidAt: 1 })
+      .limit(20)
+      .toArray();
+
+    return res.json({
+      orders: orders.map((o) => ({
+        orderId: o.orderId,
+        items: o.items || [],
+        sandbox: Boolean(o.sandbox),
+        paidAt: o.paidAt || null
+      }))
+    });
+  } catch (e) {
+    console.error("Unclaimed orders error:", e.message);
+    return res.status(500).json({ error: "Could not retrieve orders" });
+  }
+});
+
+// Called by the client AFTER it granted the reward. Idempotent: repeating it is safe.
+app.post("/api/payment/claim/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim();
-    const playerId = String(req.query.playerId || "").trim();
+    const playerId = String(req.body?.playerId || "").trim();
     if (!orderId || !playerId) {
       return res.status(400).json({ error: "orderId and playerId are required" });
     }
 
-    const order = await db.collection("payment_orders").findOne({ _id: orderId });
-    if (!order) return res.json({ orderId, status: "PENDING" });
-    if (order.playerId !== playerId) return res.status(404).json({ error: "Order not found" });
+    const orders = db.collection("payment_orders");
+    const updated = await orders.findOneAndUpdate(
+      { _id: orderId, playerId, status: "PAID", claimed: { $ne: true } },
+      { $set: { claimed: true, claimedAt: new Date(), updatedAt: new Date() } }
+    );
+    if (updated) return res.json({ orderId, claimed: true });
 
-    return res.json({
-      orderId: order.orderId,
-      playerId: order.playerId,
-      status: order.status,
-      items: order.items || [],
-      sandbox: Boolean(order.sandbox),
-      paidAt: order.paidAt || null,
-      updatedAt: order.updatedAt || null
-    });
+    const order = await orders.findOne({ _id: orderId });
+    if (!order || order.playerId !== playerId) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    if (order.claimed === true) return res.json({ orderId, claimed: true, alreadyClaimed: true });
+    return res.status(409).json({ error: "Order is not claimable", status: order.status });
   } catch (e) {
-    console.error("Payment status error:", e.message);
-    return res.status(500).json({ error: "Could not retrieve payment status" });
+    console.error("Claim order error:", e.message);
+    return res.status(500).json({ error: "Could not claim order" });
   }
 });
 
@@ -274,18 +303,7 @@ app.post("/api/payment/create", async (req, res) => {
       return res.status(502).json({ error: "Could not create order" });
     }
 
-    // $setOnInsert so a webhook that somehow arrived first is never downgraded to PENDING.
-    await db.collection("payment_orders").updateOne(
-      { _id: orderId },
-      {
-        $setOnInsert: {
-          orderId, playerId, sku, status: "PENDING",
-          createdAt: new Date(), updatedAt: new Date()
-        }
-      },
-      { upsert: true }
-    );
-
+    // Nothing is stored here: the order is created by the item.add webhook once paid.
     return res.json({ orderId, checkoutUrl });
   } catch (e) {
     console.error("Create order error:", e.message);
