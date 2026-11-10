@@ -207,6 +207,12 @@ app.get("/api/payment/unclaimed", async (req, res) => {
       .limit(20)
       .toArray();
 
+    console.log("Unclaimed check", {
+      player: playerId.slice(0, 8),
+      count: orders.length,
+      orderIds: orders.map((o) => o.orderId)
+    });
+
     return res.json({
       orders: orders.map((o) => ({
         orderId: o.orderId,
@@ -235,13 +241,21 @@ app.post("/api/payment/claim/:orderId", async (req, res) => {
       { _id: orderId, playerId, status: "PAID", claimed: { $ne: true } },
       { $set: { claimed: true, claimedAt: new Date(), updatedAt: new Date() } }
     );
-    if (updated) return res.json({ orderId, claimed: true });
+    if (updated) {
+      console.log("Claim ok", { orderId, player: playerId.slice(0, 8) });
+      return res.json({ orderId, claimed: true });
+    }
 
     const order = await orders.findOne({ _id: orderId });
     if (!order || order.playerId !== playerId) {
+      console.log("Claim not found", { orderId, player: playerId.slice(0, 8) });
       return res.status(404).json({ error: "Order not found" });
     }
-    if (order.claimed === true) return res.json({ orderId, claimed: true, alreadyClaimed: true });
+    if (order.claimed === true) {
+      console.log("Claim already claimed", { orderId, player: playerId.slice(0, 8) });
+      return res.json({ orderId, claimed: true, alreadyClaimed: true });
+    }
+    console.log("Claim rejected", { orderId, status: order.status });
     return res.status(409).json({ error: "Order is not claimable", status: order.status });
   } catch (e) {
     console.error("Claim order error:", e.message);
